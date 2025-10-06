@@ -8,10 +8,10 @@ from binance.spot import Spot
 # -----------------------------
 API_KEY = "YOUR_BINANCE_US_API_KEY"
 API_SECRET = "YOUR_BINANCE_US_API_SECRET"
-SYMBOL = "BTCUSDT"
+SYMBOL = "BTCUSDT"  # Change as needed
 TRADE_INTERVAL = 300  # 5 minutes in seconds
-CSV_FILE = "trade_log.csv"
 HEARTBEAT_INTERVAL = 900  # 15 minutes in seconds
+CSV_FILE = "trade_log.csv"
 
 # -----------------------------
 # INITIALIZE CLIENT
@@ -21,104 +21,79 @@ client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url="https://api.bina
 # -----------------------------
 # PAPER TRADING STATE
 # -----------------------------
-balance = 10000.0  # start paper balance
 position = None  # "LONG" or "SHORT"
 entry_price = None
 stop_loss = None
 take_profit = None
 high_range = None
 low_range = None
-last_heartbeat = 0
-current_trading_day = None  # track which NY day we're on
+balance = 10000.0  # Starting paper balance
+last_heartbeat = time.time() - HEARTBEAT_INTERVAL
 
 # -----------------------------
 # HELPER FUNCTIONS
 # -----------------------------
-def log_trade(position, entry_price, stop_loss, take_profit, pnl=None):
-    now = datetime.now(timezone.utc).astimezone()
+def log_trade(timestamp, position, entry, sl, tp, balance, pnl=None):
     with open(CSV_FILE, mode="a", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow([now.isoformat(), position, entry_price, stop_loss, take_profit, balance, pnl])
-    print(f"[{now}] {position} | Entry: {entry_price} | SL: {stop_loss} | TP: {take_profit} | Balance: {balance} | PnL: {pnl}")
-
-def get_first_4h_close_time():
-    """Return datetime of first fully closed 4h candle of NY day."""
-    now_ny = datetime.now(timezone(timedelta(hours=-4)))  # New York time
-    start_of_day = datetime(now_ny.year, now_ny.month, now_ny.day, tzinfo=timezone(timedelta(hours=-4)))
-    # First 4h candle closes at 4:00 NY time
-    first_close = start_of_day + timedelta(hours=4)
-    return first_close
+        writer.writerow([timestamp.isoformat(), position, entry, sl, tp, balance, pnl])
+    print(f"[{timestamp}] {position} | Entry: {entry} | SL: {sl} | TP: {tp} | Balance: {balance} | PnL: {pnl}")
 
 def get_first_4h_candle():
-    """Get the first fully closed 4-hour candle of the day (New York time)."""
-    first_close = get_first_4h_close_time()
-    candles = client.klines(SYMBOL, "4h", startTime=int((first_close - timedelta(hours=4)).timestamp()*1000), limit=1)
+    now = datetime.now(timezone(timedelta(hours=-4)))  # New York time
+    start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone(timedelta(hours=-4)))
+    candles = client.klines(SYMBOL, "4h", startTime=int(start_of_day.timestamp()*1000), limit=1)
     if not candles:
         return None, None
     first_candle = candles[0]
-    high = float(first_candle[2])
-    low = float(first_candle[3])
-    return high, low
+    return float(first_candle[2]), float(first_candle[3])  # high, low
 
 def get_last_5m_candle():
-    """Get the last fully closed 5-minute candle."""
     candles = client.klines(SYMBOL, "5m", limit=2)
     if len(candles) < 2:
         return None, None, None
     last_closed = candles[-2]
-    high = float(last_closed[2])
-    low = float(last_closed[3])
-    close = float(last_closed[4])
-    return high, low, close
+    return float(last_closed[2]), float(last_closed[3]), float(last_closed[4])  # high, low, close
+
+def in_sleep_window():
+    now = datetime.now(timezone(timedelta(hours=-4)))  # New York time
+    # Sleep from 00:00 to 03:55
+    if now.hour == 0 or (now.hour == 3 and now.minute < 55):
+        return True
+    return False
 
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
 while True:
     try:
-        now = datetime.now(timezone.utc).astimezone()
-        ny_now = now.astimezone(timezone(timedelta(hours=-4)))
-        today_ny = ny_now.date()
+        # Sleep/wake logic
+        if in_sleep_window():
+            wait_seconds = 300  # check every 5 minutes
+            print(f"[INFO] Waiting {wait_seconds} seconds for trading window...")
+            time.sleep(wait_seconds)
+            continue
 
-        # -----------------------------
-        # DAILY RESET
-        # -----------------------------
-        if current_trading_day != today_ny:
-            print(f"[RESET] New trading day detected: {today_ny}")
-            # Clear range and positions
-            high_range, low_range = None, None
-            position, entry_price, stop_loss, take_profit = None, None, None, None
-            current_trading_day = today_ny
+        # Heartbeat logging
+        if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+            now = datetime.now(timezone.utc).astimezone()
+            print(f"[HEARTBEAT] {now} | Balance: {balance} | Position: {position}")
+            last_heartbeat = time.time()
 
-        # -----------------------------
-        # Sleep until 5 minutes before first 4h candle closes
-        # -----------------------------
-        first_close = get_first_4h_close_time()
-        wake_time = first_close - timedelta(minutes=5)
-        if ny_now < wake_time and high_range is None:
-            wait_sec = (wake_time - ny_now).total_seconds()
-            print(f"[INFO] Sleeping until {wake_time} NY time ({wait_sec/60:.1f} min)...")
-            time.sleep(wait_sec)
-
-        # -----------------------------
-        # Set range if not already done
-        # -----------------------------
+        # Set range if not set
         if high_range is None or low_range is None:
             high_range, low_range = get_first_4h_candle()
-            if high_range and low_range:
-                print(f"[INFO] Range set | High: {high_range} | Low: {low_range}")
+            if high_range is None or low_range is None:
+                time.sleep(TRADE_INTERVAL)
+                continue
 
-        # -----------------------------
         # Get last 5m candle
-        # -----------------------------
         high, low, close = get_last_5m_candle()
         if high is None or low is None or close is None:
             time.sleep(TRADE_INTERVAL)
             continue
 
-        # -----------------------------
-        # Entry Logic
-        # -----------------------------
+        # Check for entries
         if position is None:
             # SHORT: Candle closed above range then back in
             if close < high_range and high > high_range:
@@ -126,7 +101,7 @@ while True:
                 entry_price = close
                 stop_loss = high_range
                 take_profit = entry_price - 2 * (stop_loss - entry_price)
-                log_trade(position, entry_price, stop_loss, take_profit)
+                log_trade(datetime.now(timezone.utc).astimezone(), position, entry_price, stop_loss, take_profit, balance)
 
             # LONG: Candle closed below range then back in
             elif close > low_range and low < low_range:
@@ -134,37 +109,29 @@ while True:
                 entry_price = close
                 stop_loss = low_range
                 take_profit = entry_price + 2 * (entry_price - stop_loss)
-                log_trade(position, entry_price, stop_loss, take_profit)
+                log_trade(datetime.now(timezone.utc).astimezone(), position, entry_price, stop_loss, take_profit, balance)
 
-        # -----------------------------
-        # Exit Logic
-        # -----------------------------
+        # Check for exits
         if position is not None:
-            pnl = 0
+            pnl = None
             if position == "LONG":
                 if close <= stop_loss or close >= take_profit:
-                    pnl = close - entry_price
-                    balance_change = pnl
-                    balance += balance_change
-                    print(f"[EXIT] LONG at {close} | PnL: {pnl} | Balance: {balance}")
-                    log_trade("EXIT LONG", entry_price, stop_loss, take_profit, pnl)
-                    position, entry_price, stop_loss, take_profit = None, None, None, None
-
+                    pnl = (close - entry_price) * (balance / entry_price)
+                    balance += pnl
+                    log_trade(datetime.now(timezone.utc).astimezone(), f"EXIT {position}", entry_price, stop_loss, take_profit, balance, pnl)
+                    position = None
+                    entry_price = None
+                    stop_loss = None
+                    take_profit = None
             elif position == "SHORT":
                 if close >= stop_loss or close <= take_profit:
-                    pnl = entry_price - close
-                    balance_change = pnl
-                    balance += balance_change
-                    print(f"[EXIT] SHORT at {close} | PnL: {pnl} | Balance: {balance}")
-                    log_trade("EXIT SHORT", entry_price, stop_loss, take_profit, pnl)
-                    position, entry_price, stop_loss, take_profit = None, None, None, None
-
-        # -----------------------------
-        # Heartbeat every 15 min
-        # -----------------------------
-        if (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL:
-            print(f"[HEARTBEAT] {now} | Balance: {balance} | Position: {position}")
-            last_heartbeat = time.time()
+                    pnl = (entry_price - close) * (balance / entry_price)
+                    balance += pnl
+                    log_trade(datetime.now(timezone.utc).astimezone(), f"EXIT {position}", entry_price, stop_loss, take_profit, balance, pnl)
+                    position = None
+                    entry_price = None
+                    stop_loss = None
+                    take_profit = None
 
         time.sleep(TRADE_INTERVAL)
 
